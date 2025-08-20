@@ -2,7 +2,7 @@
 from __future__ import unicode_literals
 from . import __version__ as app_version
 
-app_name = "whatsapp_erpnext"
+app_name = "twilio_integration"
 app_title = "Twilio Integration"
 app_publisher = "Frappe"
 app_description = "Custom Frappe Application for Twilio Integration"
