@@ -5,10 +5,10 @@ with open('requirements.txt') as f:
 	install_requires = f.read().strip().split('\n')
 
 # get version from __version__ variable in twilio_integration/__init__.py
-from whatsapp_erpnext import __version__ as version
+from twilio_integration import __version__ as version
 
 setup(
-	name='whatsapp_erpnext',
+	name='twilio_integration',
 	version=version,
 	description='Custom Frappe Application for Twilio Integration',
 	author='Frappe',
