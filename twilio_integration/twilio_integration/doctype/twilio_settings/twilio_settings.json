@@ -1,0 +1,189 @@
+{
+ "actions": [],
+ "creation": "2020-01-28 15:21:44.457163",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "account_sid",
+  "enabled",
+  "column_break_3",
+  "auth_token",
+  "record_calls",
+  "whatsapp_section",
+  "whatsapp_no",
+  "column_break_8",
+  "reply_message",
+  "section_break_6",
+  "api_key",
+  "api_secret",
+  "column_break_9",
+  "twiml_sid",
+  "outgoing_voice_medium",
+  "document_sharing_section",
+  "enable_document_sharing",
+  "default_pdf_message",
+  "enable_workflow_actions",
+  "enable_customer_orders",
+  "notifications_section",
+  "enable_whatsapp_notifications",
+  "notification_template"
+ ],
+ "fields": [
+  {
+   "default": "0",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enabled"
+  },
+  {
+   "fieldname": "account_sid",
+   "fieldtype": "Data",
+   "label": "Account SID",
+   "mandatory_depends_on": "eval: doc.enabled"
+  },
+  {
+   "fieldname": "auth_token",
+   "fieldtype": "Password",
+   "label": "Auth Token",
+   "mandatory_depends_on": "eval: doc.enabled"
+  },
+  {
+   "fieldname": "api_key",
+   "fieldtype": "Data",
+   "label": "API Key",
+   "permlevel": 1
+  },
+  {
+   "fieldname": "api_secret",
+   "fieldtype": "Password",
+   "label": "API Secret",
+   "permlevel": 1
+  },
+  {
+   "fieldname": "twiml_sid",
+   "fieldtype": "Data",
+   "label": "TwiML SID",
+   "permlevel": 1
+  },
+  {
+   "fieldname": "column_break_3",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "1",
+   "fieldname": "record_calls",
+   "fieldtype": "Check",
+   "label": "Record Calls"
+  },
+  {
+   "fieldname": "outgoing_voice_medium",
+   "fieldtype": "Link",
+   "label": "Outgoing Voice Medium",
+   "options": "Communication Medium",
+   "permlevel": 1
+  },
+  {
+   "fieldname": "section_break_6",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "column_break_9",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "whatsapp_section",
+   "fieldtype": "Section Break",
+   "label": "WhatsApp"
+  },
+  {
+   "fieldname": "whatsapp_no",
+   "fieldtype": "Data",
+   "label": "Number",
+   "options": "Phone"
+  },
+  {
+   "fieldname": "column_break_8",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "reply_message",
+   "fieldtype": "Small Text",
+   "label": "Reply Message",
+   "mandatory_depends_on": "whatsapp_no"
+  },
+  {
+   "fieldname": "document_sharing_section",
+   "fieldtype": "Section Break",
+   "label": "Document Sharing Configuration"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_document_sharing",
+   "fieldtype": "Check",
+   "label": "Enable WhatsApp Document Sharing"
+  },
+  {
+   "default": "\ud83d\udcc4 Please find the attached document.",
+   "depends_on": "enable_document_sharing",
+   "fieldname": "default_pdf_message",
+   "fieldtype": "Text",
+   "label": "Default PDF Message"
+  },
+  {
+   "fieldname": "notifications_section",
+   "fieldtype": "Section Break",
+   "label": "WhatsApp Notifications"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_whatsapp_notifications",
+   "fieldtype": "Check",
+   "label": "Enable WhatsApp as Notification Channel"
+  },
+  {
+   "default": "\ud83d\udd14 *{subject}*\n\n{message}",
+   "depends_on": "enable_whatsapp_notifications",
+   "description": "Use {subject} and {message} as placeholders",
+   "fieldname": "notification_template",
+   "fieldtype": "Text",
+   "label": "Notification Message Template"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_workflow_actions",
+   "fieldtype": "Check",
+   "label": "enable_workflow_actions"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_customer_orders",
+   "fieldtype": "Check",
+   "label": "enable_customer_orders"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2025-08-11 15:09:05.668039",
+ "modified_by": "Administrator",
+ "module": "Twilio Integration",
+ "name": "Twilio Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
