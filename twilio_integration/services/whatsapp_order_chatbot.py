@@ -1,745 +1,399 @@
 import frappe
 from twilio.rest import Client
 import json
-import re
 from datetime import datetime, timedelta
-import pytz
-from difflib import SequenceMatcher
 
-# Configuration - Move to Site Config or DocType for production
-STATIC_TWILIO_SID = "AC7b3d98150c02344e32fa5550a488aeda"
-STATIC_TWILIO_TOKEN = "aa40c5f5460634a165829d823fa477a8"
-STATIC_WHATSAPP_FROM = "+256770787451"
-
-# Order states for conversation flow
-ORDER_STATES = {
-    'START': 'start',
-    'CUSTOMER_NAME': 'customer_name',
-    'CUSTOMER_PHONE': 'customer_phone',
-    'ADDING_ITEMS': 'adding_items',
-    'ITEM_SEARCH': 'item_search',
-    'ITEM_SELECTION': 'item_selection',
-    'ITEM_QUANTITY': 'item_quantity',
-    'CONFIRM_ITEM': 'confirm_item',
-    'MORE_ITEMS': 'more_items',
-    'DELIVERY_DATE': 'delivery_date',
-    'DELIVERY_ADDRESS': 'delivery_address',
-    'CONFIRM_ORDER': 'confirm_order',
-    'COMPLETED': 'completed'
-}
+# Configuration
+twilio_settings = frappe.get_doc("whatsapp integration settings")
+STATIC_TWILIO_SID = twilio_settings.twilio_sid
+STATIC_TWILIO_TOKEN = twilio_settings.twilio_token
+STATIC_WHATSAPP_FROM = twilio_settings.twilio_number
 
 @frappe.whitelist(allow_guest=True)
 def handle_whatsapp_chatbot():
     """Main webhook handler for WhatsApp chatbot"""
     try:
-        # Get the message content
         message_body = frappe.form_dict.get('Body', '').strip()
         from_number = frappe.form_dict.get('From', '').replace('whatsapp:', '').replace('+', '')
         
-        # Short logging to avoid character limit
-        frappe.log_error(f"MSG: '{message_body}' FROM: +{from_number}", "Chatbot")
+        frappe.log_error(f"Received: {message_body} from {from_number}", "WhatsApp Message")
         
         if not message_body or not from_number:
             return "OK"
         
-        # Handle special commands
-        if message_body.lower() in ['reset', 'restart', 'cancel', 'stop']:
-            reset_user_session(from_number)
-            send_message(from_number, "🔄 Session reset. Type 'HELLO' to start a new order.")
-            return "OK"
-            
-        if message_body.lower() in ['help', 'menu']:
-            send_help_message(from_number)
+        # Handle reset commands
+        if message_body.lower() in ['reset', 'restart', 'cancel', '0', 'start']:
+            reset_and_start(from_number)
             return "OK"
         
-        # Get or create user session
-        session = get_user_session(from_number)
-        
-        # Process the message based on current state
-        process_chatbot_message(from_number, message_body, session)
-        
+        # Process message
+        process_message(from_number, message_body)
         return "OK"
         
     except Exception as e:
-        frappe.log_error(f"Error: {str(e)[:100]}", "Chatbot Error")
-        # Send error message to user
-        try:
-            send_message(from_number, "❌ Something went wrong. Type 'HELLO' to restart.")
-        except:
-            pass
+        frappe.log_error(f"Chatbot error: {str(e)}", "Chatbot Error")
         return "Error"
 
-def send_help_message(phone_number):
-    """Send help information"""
-    help_msg = """🤖 WhatsApp Order Assistant Help
-
-📋 Available Commands:
-• HELLO - Start new order
-• HELP - Show this menu
-• RESET - Reset current session
-• CANCEL - Cancel current order
-• STOP - End conversation
-
-📞 For support, contact us directly.
-
-Type 'HELLO' to start ordering! 🛒"""
-    
-    send_message(phone_number, help_msg)
-
-def get_user_session(phone_number):
-    """Get or create user session for conversation state"""
+def process_message(phone_number, message):
+    """Process incoming message based on simple state"""
     try:
-        # Check if session exists in database
-        existing_sessions = frappe.get_all(
-            "WhatsApp Order Session",
-            filters={"phone_number": phone_number, "status": "Active"},
-            fields=["name", "current_state", "order_data"],
-            order_by="creation desc",
-            limit=1
-        )
+        # Get current state from cache or database
+        state = get_user_state(phone_number)
         
-        if existing_sessions:
-            session = frappe.get_doc("WhatsApp Order Session", existing_sessions[0].name)
-            return session
+        frappe.log_error(f"Current state for {phone_number}: {state}", "State Check")
+        
+        if state == "START" or not state:
+            handle_main_menu(phone_number, message)
+        elif state == "MAIN_MENU":
+            handle_main_menu_choice(phone_number, message)
+        elif state == "CUSTOMER_SELECT":
+            handle_customer_choice(phone_number, message)
+        elif state == "NEW_CUSTOMER_NAME":
+            handle_new_customer_name(phone_number, message)
+        elif state == "ITEMS_BROWSE":
+            handle_items_browse(phone_number, message)
+        elif state == "ITEM_SELECTED":
+            handle_item_selection(phone_number, message)
+        elif state == "QUANTITY":
+            handle_quantity_input(phone_number, message)
+        elif state == "CART_MENU":
+            handle_cart_menu(phone_number, message)
+        elif state == "CHECKOUT":
+            handle_checkout(phone_number, message)
         else:
-            # Create new session
-            session = frappe.new_doc("WhatsApp Order Session")
-            session.phone_number = phone_number
-            session.current_state = ORDER_STATES['START']
-            session.order_data = "{}"
-            session.status = "Active"
-            session.session_started = datetime.now()
-            session.insert(ignore_permissions=True)
-            frappe.db.commit()
-            return session
+            # Reset if unknown state
+            reset_and_start(phone_number)
             
     except Exception as e:
-        frappe.log_error(f"Session error: {str(e)[:100]}", "Session Error")
-        # Return a basic session object if database operations fail
-        return type('Session', (), {
-            'phone_number': phone_number,
-            'current_state': ORDER_STATES['START'],
-            'order_data': "{}",
-            'save': lambda: None
-        })()
+        frappe.log_error(f"Process message error: {str(e)}", "Process Error")
+        send_message(phone_number, "❌ Error occurred. Restarting...")
+        reset_and_start(phone_number)
 
-def reset_user_session(phone_number):
-    """Reset user session"""
-    try:
-        # Mark existing sessions as cancelled
-        frappe.db.sql("""
-            UPDATE `tabWhatsApp Order Session` 
-            SET status = 'Cancelled', session_ended = %s
-            WHERE phone_number = %s AND status = 'Active'
-        """, (datetime.now(), phone_number))
-        frappe.db.commit()
-    except Exception as e:
-        frappe.log_error(f"Reset error: {str(e)[:100]}", "Reset Error")
+def handle_main_menu(phone_number, message):
+    """Show main menu"""
+    msg = """🛒 *WELCOME TO OUR STORE*
 
-def process_chatbot_message(phone_number, message, session):
-    """Process message based on current conversation state"""
-    try:
-        current_state = session.current_state
-        order_data = json.loads(session.order_data or "{}")
-        
-        # Handle different conversation states
-        if current_state == ORDER_STATES['START']:
-            handle_start_conversation(phone_number, message, session, order_data)
-            
-        elif current_state == ORDER_STATES['CUSTOMER_NAME']:
-            handle_customer_name(phone_number, message, session, order_data)
-            
-        elif current_state == ORDER_STATES['CUSTOMER_PHONE']:
-            handle_customer_phone(phone_number, message, session, order_data)
-            
-        elif current_state == ORDER_STATES['ITEM_SEARCH']:
-            handle_item_search(phone_number, message, session, order_data)
-            
-        elif current_state == ORDER_STATES['ITEM_SELECTION']:
-            handle_item_selection(phone_number, message, session, order_data)
-            
-        elif current_state == ORDER_STATES['ITEM_QUANTITY']:
-            handle_item_quantity(phone_number, message, session, order_data)
-            
-        elif current_state == ORDER_STATES['CONFIRM_ITEM']:
-            handle_confirm_item(phone_number, message, session, order_data)
-            
-        elif current_state == ORDER_STATES['MORE_ITEMS']:
-            handle_more_items(phone_number, message, session, order_data)
-            
-        elif current_state == ORDER_STATES['DELIVERY_DATE']:
-            handle_delivery_date(phone_number, message, session, order_data)
-            
-        elif current_state == ORDER_STATES['DELIVERY_ADDRESS']:
-            handle_delivery_address(phone_number, message, session, order_data)
-            
-        elif current_state == ORDER_STATES['CONFIRM_ORDER']:
-            handle_confirm_order(phone_number, message, session, order_data)
-            
-        else:
-            # Reset conversation if unknown state
-            reset_conversation(phone_number, session)
-            
-    except Exception as e:
-        frappe.log_error(f"Process error: {str(e)[:100]}", "Process Error")
-        send_message(phone_number, "❌ Sorry, something went wrong. Let's start over. Type 'HELLO' to begin.")
-        reset_conversation(phone_number, session)
+Select an option:
+*1* - 🛍️ Browse & Order Items
+*2* - 📞 Contact Support
+*3* - ℹ️ About Us
 
-# =============================================================================
-# HANDLER FUNCTIONS - Enhanced with item filtering
-# =============================================================================
-
-def handle_start_conversation(phone_number, message, session, order_data):
-    """Handle start of conversation"""
-    if message.lower() in ['hello', 'hi', 'start', 'order']:
-        msg = """🛒 Welcome to our WhatsApp ordering service!
-
-Let's start your order. What's your name?"""
-        
-        session.current_state = ORDER_STATES['CUSTOMER_NAME']
-        update_session(session, order_data)
-        send_message(phone_number, msg)
-    else:
-        msg = """👋 Hello! Welcome to our ordering service.
-
-Type 'HELLO' to start placing an order
-Type 'HELP' for assistance"""
-        send_message(phone_number, msg)
-
-def handle_customer_name(phone_number, message, session, order_data):
-    """Handle customer name input and find closest customer match"""
-    customer_name = message.strip()
+Type a number (1-3):"""
     
-    # Search for existing customers with similar names
-    existing_customer = find_closest_customer(customer_name)
-    
-    if existing_customer:
-        order_data['customer_name'] = existing_customer['customer_name']
-        order_data['customer'] = existing_customer['name']
-        order_data['customer_phone'] = existing_customer.get('mobile_no', '')
-        
-        msg = f"""✅ Found existing customer: {existing_customer['customer_name']}
-📞 Phone: {existing_customer.get('mobile_no', 'Not provided')}
-
-Is this you? Reply 'YES' to continue or 'NO' to create new customer."""
-        
-        order_data['confirm_customer'] = True
-        update_session(session, order_data)
-        send_message(phone_number, msg)
-    else:
-        order_data['customer_name'] = customer_name
-        
-        msg = f"""Thanks {customer_name}! 👤
-
-Now, please provide your phone number for delivery confirmation."""
-        
-        session.current_state = ORDER_STATES['CUSTOMER_PHONE']
-        update_session(session, order_data)
-        send_message(phone_number, msg)
-
-def handle_customer_phone(phone_number, message, session, order_data):
-    """Handle customer phone input or customer confirmation"""
-    # Check if we're confirming an existing customer
-    if order_data.get('confirm_customer'):
-        if message.lower() in ['yes', 'y', 'correct']:
-            del order_data['confirm_customer']
-            order_data['items'] = []
-            
-            msg = """✅ Customer confirmed!
-
-Now let's add items to your order. What item would you like to order?
-(e.g., "sugar", "rice", "bread")"""
-            
-            session.current_state = ORDER_STATES['ITEM_SEARCH']
-            update_session(session, order_data)
-            send_message(phone_number, msg)
-            return
-        elif message.lower() in ['no', 'n', 'wrong']:
-            del order_data['confirm_customer']
-            msg = """Please provide your phone number for delivery confirmation:"""
-            session.current_state = ORDER_STATES['CUSTOMER_PHONE']
-            update_session(session, order_data)
-            send_message(phone_number, msg)
-            return
-    
-    # Handle phone number input
-    clean_phone = re.sub(r'[^\d+]', '', message)
-    if len(clean_phone) < 10:
-        send_message(phone_number, "❌ Please enter a valid phone number (at least 10 digits)")
-        return
-    
-    order_data['customer_phone'] = clean_phone
-    order_data['items'] = []
-    
-    msg = """📞 Phone number saved!
-
-Now let's add items to your order. What item would you like to order?
-(e.g., "sugar", "rice", "bread")"""
-    
-    session.current_state = ORDER_STATES['ITEM_SEARCH']
-    update_session(session, order_data)
+    set_user_state(phone_number, "MAIN_MENU")
     send_message(phone_number, msg)
 
-def handle_item_search(phone_number, message, session, order_data):
-    """Handle item search and show matches"""
-    search_term = message.strip()
-    
-    # Search for items
-    matched_items = search_items(search_term)
-    
-    if not matched_items:
-        msg = f"""❌ No items found matching "{search_term}".
-
-Please try a different item name or contact support."""
-        send_message(phone_number, msg)
-        return
-    
-    if len(matched_items) == 1:
-        # Exact match found
-        item = matched_items[0]
-        order_data['selected_item'] = item
-        
-        msg = f"""✅ Item Found: {item['item_name']}
-💰 Price: {item['standard_rate']:,.0f} per {item['stock_uom']}
-
-How many {item['stock_uom'].lower()} do you want?"""
-        
-        session.current_state = ORDER_STATES['ITEM_QUANTITY']
-        update_session(session, order_data)
-        send_message(phone_number, msg)
-    else:
-        # Multiple matches found
-        msg = f"""🔍 Found {len(matched_items)} items matching "{search_term}":\n\n"""
-        
-        order_data['search_results'] = matched_items
-        
-        for i, item in enumerate(matched_items[:5], 1):  # Show max 5 items
-            price = item.get('standard_rate', 0)
-            price_text = f"{price:,.0f}" if price > 0 else "Price not set"
-            msg += f"{i}. {item['item_name']}\n   💰 {price_text} per {item['stock_uom']}\n\n"
-        
-        msg += "Reply with the number (1-5) to select an item:"
-        
-        session.current_state = ORDER_STATES['ITEM_SELECTION']
-        update_session(session, order_data)
-        send_message(phone_number, msg)
-
-def handle_item_selection(phone_number, message, session, order_data):
-    """Handle item selection from search results"""
+def handle_main_menu_choice(phone_number, message):
+    """Handle main menu selection"""
     try:
-        selection = int(message.strip())
-        search_results = order_data.get('search_results', [])
+        choice = int(message.strip())
         
-        if 1 <= selection <= len(search_results) and selection <= 5:
-            selected_item = search_results[selection - 1]
-            order_data['selected_item'] = selected_item
-            
-            price = selected_item.get('standard_rate', 0)
-            if price <= 0:
-                msg = f"""⚠️ Item: {selected_item['item_name']}
-❌ Price not set for this item.
+        if choice == 1:
+            # Start ordering process
+            show_customer_options(phone_number)
+        elif choice == 2:
+            # Contact support
+            msg = """📞 *CONTACT SUPPORT*
 
-Please contact support or try another item."""
-                
-                session.current_state = ORDER_STATES['ITEM_SEARCH']
-                update_session(session, order_data)
-                send_message(phone_number, msg)
-                return
-            
-            msg = f"""✅ Selected: {selected_item['item_name']}
-💰 Price: {price:,.0f} per {selected_item['stock_uom']}
+Phone: +256-XXX-XXXXXX
+Email: support@store.com
+Hours: 8AM - 6PM
 
-How many {selected_item['stock_uom'].lower()} do you want?"""
-            
-            session.current_state = ORDER_STATES['ITEM_QUANTITY']
-            update_session(session, order_data)
+Type *0* to return to main menu."""
+            send_message(phone_number, msg)
+        elif choice == 3:
+            # About us
+            msg = """ℹ️ *ABOUT US*
+
+Your trusted online store!
+✅ Quality products
+✅ Fast delivery
+✅ 24/7 WhatsApp ordering
+
+Type *0* to return to main menu."""
             send_message(phone_number, msg)
         else:
-            send_message(phone_number, f"❌ Please select a number between 1 and {min(len(search_results), 5)}")
+            send_message(phone_number, "❌ Please choose 1, 2, or 3")
+            
+    except ValueError:
+        send_message(phone_number, "❌ Please enter a valid number (1-3)")
+
+def show_customer_options(phone_number):
+    """Show customer selection options"""
+    msg = """👤 *CUSTOMER INFO*
+
+*1* - 🆕 New Customer
+*2* - 🔍 Existing Customer
+
+Type 1 or 2:"""
+    
+    set_user_state(phone_number, "CUSTOMER_SELECT")
+    send_message(phone_number, msg)
+
+def handle_customer_choice(phone_number, message):
+    """Handle customer selection"""
+    try:
+        choice = int(message.strip())
+        
+        if choice == 1:
+            # New customer
+            msg = "👤 Please enter your name:"
+            set_user_state(phone_number, "NEW_CUSTOMER_NAME")
+            send_message(phone_number, msg)
+        elif choice == 2:
+            # Skip customer creation for now
+            show_items_menu(phone_number)
+        else:
+            send_message(phone_number, "❌ Please choose 1 or 2")
+            
+    except ValueError:
+        send_message(phone_number, "❌ Please enter 1 or 2")
+
+def handle_new_customer_name(phone_number, message):
+    """Handle new customer name input"""
+    name = message.strip()
+    
+    if len(name) < 2:
+        send_message(phone_number, "❌ Please enter a valid name (at least 2 characters)")
+        return
+    
+    # Save customer name temporarily
+    save_temp_data(phone_number, "customer_name", name)
+    
+    # Move to items
+    show_items_menu(phone_number)
+
+def show_items_menu(phone_number):
+    """Show available items"""
+    try:
+        frappe.log_error(f"Showing items menu for {phone_number}", "Items Menu Debug")
+        
+        # Get some items from database
+        items = get_available_items()
+        
+        frappe.log_error(f"Retrieved {len(items)} items for {phone_number}", "Items Retrieved")
+        
+        if not items:
+            # Send more helpful message and try to diagnose
+            msg = """❌ *NO ITEMS FOUND*
+
+This might be because:
+• No items are marked as 'Sales Item'
+• No items have prices set
+• Items might be disabled
+
+Please contact admin or try again later.
+
+Type *0* to go back to main menu."""
+            
+            frappe.log_error(f"No items available for {phone_number}", "No Items Error")
+            send_message(phone_number, msg)
+            set_user_state(phone_number, "MAIN_MENU")
+            return
+        
+        msg = "📦 *AVAILABLE ITEMS*\n\n"
+        
+        # Show first 5 items
+        for i, item in enumerate(items[:5], 1):
+            price = item.get('standard_rate', 0)
+            price_text = f"{price:,.0f} UGX" if price > 0 else "Price on request"
+            uom = item.get('stock_uom', 'unit')
+            msg += f"*{i}* - {item['item_name']}\n     💰 {price_text} per {uom}\n\n"
+        
+        msg += "Type item number (1-5):"
+        
+        # Save items for reference
+        save_temp_data(phone_number, "current_items", items[:5])
+        set_user_state(phone_number, "ITEMS_BROWSE")
+        
+        frappe.log_error(f"Sending items menu to {phone_number}", "Items Menu Sent")
+        send_message(phone_number, msg)
+        
+    except Exception as e:
+        frappe.log_error(f"Items menu error: {str(e)}", "Items Menu Error")
+        send_message(phone_number, "❌ Error loading items. Type *0* to go back to main menu.")
+        set_user_state(phone_number, "MAIN_MENU")
+
+def handle_items_browse(phone_number, message):
+    """Handle item selection"""
+    try:
+        choice = int(message.strip())
+        items = get_temp_data(phone_number, "current_items") or []
+        
+        if 1 <= choice <= len(items):
+            selected_item = items[choice - 1]
+            
+            # Show item details
+            price = selected_item.get('standard_rate', 0)
+            if price <= 0:
+                send_message(phone_number, "❌ This item is not available for purchase.")
+                return
+            
+            msg = f"""📦 *{selected_item['item_name']}*
+
+💰 Price: {price:,.0f} UGX per {selected_item.get('stock_uom', 'unit')}
+
+*1* - ➕ Add to Cart
+*2* - 🔙 Back to Items
+
+Choose 1 or 2:"""
+            
+            save_temp_data(phone_number, "selected_item", selected_item)
+            set_user_state(phone_number, "ITEM_SELECTED")
+            send_message(phone_number, msg)
+        else:
+            send_message(phone_number, f"❌ Please choose 1-{len(items)}")
             
     except ValueError:
         send_message(phone_number, "❌ Please enter a valid number")
 
-def handle_item_quantity(phone_number, message, session, order_data):
-    """Handle item quantity input"""
+def handle_item_selection(phone_number, message):
+    """Handle add to cart or back"""
     try:
-        quantity = float(message.strip())
-        if quantity <= 0:
-            send_message(phone_number, "❌ Please enter a valid quantity (greater than 0)")
+        choice = int(message.strip())
+        
+        if choice == 1:
+            # Add to cart - ask for quantity
+            msg = "📊 Enter quantity (e.g., 1, 2, 5):"
+            set_user_state(phone_number, "QUANTITY")
+            send_message(phone_number, msg)
+        elif choice == 2:
+            # Back to items
+            show_items_menu(phone_number)
+        else:
+            send_message(phone_number, "❌ Please choose 1 or 2")
+            
+    except ValueError:
+        send_message(phone_number, "❌ Please enter 1 or 2")
+
+def handle_quantity_input(phone_number, message):
+    """Handle quantity input"""
+    try:
+        qty = float(message.strip())
+        
+        if qty <= 0:
+            send_message(phone_number, "❌ Please enter a quantity greater than 0")
             return
         
-        selected_item = order_data['selected_item']
-        rate = selected_item.get('standard_rate', 0)
-        total = quantity * rate
+        selected_item = get_temp_data(phone_number, "selected_item")
+        if not selected_item:
+            send_message(phone_number, "❌ Error: No item selected")
+            return
         
-        order_data['current_item'] = {
-            'item_code': selected_item['name'],
+        # Calculate total
+        price = selected_item.get('standard_rate', 0)
+        total = qty * price
+        
+        # Add to cart
+        cart_item = {
             'item_name': selected_item['item_name'],
-            'quantity': quantity,
-            'rate': rate,
-            'uom': selected_item['stock_uom'],
-            'amount': total
+            'item_code': selected_item.get('name', ''),
+            'qty': qty,
+            'rate': price,
+            'total': total,
+            'uom': selected_item.get('stock_uom', 'unit')
         }
         
-        msg = f"""💰 Item Summary:
-📦 Item: {selected_item['item_name']}
-📊 Quantity: {quantity} {selected_item['stock_uom']}
-💵 Price: {rate:,.0f} per {selected_item['stock_uom']}
-💰 Total: {total:,.0f}
-
-Is this correct? Reply 'YES' to confirm or 'NO' to change"""
+        add_to_cart(phone_number, cart_item)
         
-        session.current_state = ORDER_STATES['CONFIRM_ITEM']
-        update_session(session, order_data)
+        msg = f"""✅ Added to cart!
+
+📦 {selected_item['item_name']}
+📊 Quantity: {qty}
+💰 Total: {total:,.0f} UGX
+
+*1* - 🛍️ Continue Shopping
+*2* - 🛒 View Cart & Checkout
+
+Choose 1 or 2:"""
+        
+        set_user_state(phone_number, "CART_MENU")
         send_message(phone_number, msg)
         
     except ValueError:
         send_message(phone_number, "❌ Please enter a valid number for quantity")
 
-def handle_confirm_item(phone_number, message, session, order_data):
-    """Handle item confirmation"""
-    if message.lower() in ['yes', 'y', 'confirm', 'ok']:
-        # Add item to order
-        if 'items' not in order_data:
-            order_data['items'] = []
-        order_data['items'].append(order_data['current_item'])
-        del order_data['current_item']
-        if 'selected_item' in order_data:
-            del order_data['selected_item']
+def handle_cart_menu(phone_number, message):
+    """Handle cart menu options"""
+    try:
+        choice = int(message.strip())
         
-        msg = f"""✅ Item added successfully!
+        if choice == 1:
+            # Continue shopping
+            show_items_menu(phone_number)
+        elif choice == 2:
+            # View cart and checkout
+            show_cart_summary(phone_number)
+        else:
+            send_message(phone_number, "❌ Please choose 1 or 2")
+            
+    except ValueError:
+        send_message(phone_number, "❌ Please enter 1 or 2")
 
-Would you like to add another item?
-• Reply 'YES' to add more items
-• Reply 'NO' to proceed to delivery details"""
-        
-        session.current_state = ORDER_STATES['MORE_ITEMS']
-        update_session(session, order_data)
-        send_message(phone_number, msg)
-        
-    elif message.lower() in ['no', 'n', 'change']:
-        msg = """Let's start over with this item.
-
-What item would you like to order?"""
-        
-        session.current_state = ORDER_STATES['ITEM_SEARCH']
-        update_session(session, order_data)
-        send_message(phone_number, msg)
-    else:
-        send_message(phone_number, "Please reply 'YES' to confirm or 'NO' to change the item details")
-
-def handle_more_items(phone_number, message, session, order_data):
-    """Handle more items question"""
-    if message.lower() in ['yes', 'y', 'add', 'more']:
-        msg = """What's the next item you'd like to add to your order?"""
-        
-        session.current_state = ORDER_STATES['ITEM_SEARCH']
-        update_session(session, order_data)
-        send_message(phone_number, msg)
-        
-    elif message.lower() in ['no', 'n', 'done', 'finish']:
-        # Show order summary and ask for delivery date
-        summary = "📋 ORDER SUMMARY:\n\n"
-        total = 0
-        for i, item in enumerate(order_data['items'], 1):
-            item_total = item['amount']
-            total += item_total
-            summary += f"{i}. {item['item_name']}\n   {item['quantity']} {item['uom']} × {item['rate']:,.0f} = {item_total:,.0f}\n\n"
-        
-        summary += f"💰 TOTAL: {total:,.0f}\n\n"
-        summary += "When do you need this delivered?\n(e.g., 'Today', 'Tomorrow', '2024-01-15')"
-        
-        session.current_state = ORDER_STATES['DELIVERY_DATE']
-        update_session(session, order_data)
-        send_message(phone_number, summary)
-    else:
-        send_message(phone_number, "Please reply 'YES' to add more items or 'NO' to proceed")
-
-def handle_delivery_date(phone_number, message, session, order_data):
-    """Handle delivery date input"""
-    order_data['delivery_date'] = message.strip()
+def show_cart_summary(phone_number):
+    """Show cart summary and checkout"""
+    cart = get_temp_data(phone_number, "cart") or []
     
-    msg = f"""📅 Delivery date: {message}
-
-Please provide your delivery address:"""
+    if not cart:
+        send_message(phone_number, "🛒 Your cart is empty!")
+        show_items_menu(phone_number)
+        return
     
-    session.current_state = ORDER_STATES['DELIVERY_ADDRESS']
-    update_session(session, order_data)
+    total = 0
+    msg = "🛒 *YOUR CART*\n\n"
+    
+    for i, item in enumerate(cart, 1):
+        total += item['total']
+        msg += f"{i}. {item['item_name']}\n"
+        msg += f"   {item['qty']} × {item['rate']:,.0f} = {item['total']:,.0f} UGX\n\n"
+    
+    msg += f"💰 *TOTAL: {total:,.0f} UGX*\n\n"
+    msg += "*1* - ✅ Place Order\n*2* - 🛍️ Continue Shopping\n\nChoose 1 or 2:"
+    
+    set_user_state(phone_number, "CHECKOUT")
     send_message(phone_number, msg)
 
-def handle_delivery_address(phone_number, message, session, order_data):
-    """Handle delivery address input"""
-    order_data['delivery_address'] = message.strip()
-    
-    # Final order summary
-    summary = "🔍 FINAL ORDER REVIEW:\n\n"
-    summary += f"👤 Customer: {order_data['customer_name']}\n"
-    summary += f"📞 Phone: {order_data['customer_phone']}\n"
-    summary += f"📅 Delivery: {order_data['delivery_date']}\n"
-    summary += f"📍 Address: {order_data['delivery_address']}\n\n"
-    
-    summary += "📦 ITEMS:\n"
-    total = 0
-    for i, item in enumerate(order_data['items'], 1):
-        item_total = item['amount']
-        total += item_total
-        summary += f"{i}. {item['item_name']}\n   {item['quantity']} {item['uom']} × {item['rate']:,.0f} = {item_total:,.0f}\n"
-    
-    summary += f"\n💰 GRAND TOTAL: {total:,.0f}\n\n"
-    summary += "Confirm your order? Reply 'CONFIRM' to place order or 'CANCEL' to cancel"
-    
-    session.current_state = ORDER_STATES['CONFIRM_ORDER']
-    update_session(session, order_data)
-    send_message(phone_number, summary)
+def handle_checkout(phone_number, message):
+    """Handle checkout process"""
+    try:
+        choice = int(message.strip())
+        
+        if choice == 1:
+            # Place order
+            success = create_order(phone_number)
+            if success:
+                msg = """🎉 *ORDER PLACED SUCCESSFULLY!*
 
-def handle_confirm_order(phone_number, message, session, order_data):
-    """Handle final order confirmation"""
-    if message.lower() in ['confirm', 'yes', 'place', 'order']:
-        try:
-            # Create Sales Order
-            sales_order = create_sales_order(order_data)
-            
-            if sales_order:
-                msg = f"""✅ ORDER PLACED SUCCESSFULLY!
+Thank you for your order!
+We'll contact you soon for delivery details.
 
-📋 Order Number: {sales_order.name}
-💰 Total Amount: {sales_order.grand_total:,.0f}
-
-Thank you for your order! We'll contact you soon for confirmation.
-
-Type 'HELLO' to place another order."""
+Type *0* to start a new order."""
                 
-                # Mark session as completed
-                session.status = "Completed"
-                session.session_ended = datetime.now()
-                session.created_sales_order = sales_order.name
-                session.current_state = ORDER_STATES['COMPLETED']
-                update_session(session, order_data)
-                
+                # Clear cart and reset
+                clear_user_data(phone_number)
+                send_message(phone_number, msg)
             else:
-                msg = """❌ Sorry, there was an error creating your order. 
-
-Please try again or contact support."""
-            
-            send_message(phone_number, msg)
-            
-        except Exception as e:
-            frappe.log_error(f"Order creation error: {str(e)[:100]}", "Order Error")
-            send_message(phone_number, "❌ Sorry, there was an error. Please try again or contact support.")
-            
-    elif message.lower() in ['cancel', 'no', 'stop']:
-        send_message(phone_number, "❌ Order cancelled. Type 'HELLO' to start a new order.")
-        reset_user_session(phone_number)
-    else:
-        send_message(phone_number, "Please reply 'CONFIRM' to place your order or 'CANCEL' to cancel")
-
-# =============================================================================
-# NEW SEARCH AND MATCHING FUNCTIONS
-# =============================================================================
-
-def search_items(search_term):
-    """Search for items using fuzzy matching"""
-    try:
-        # First, try exact match
-        exact_matches = frappe.get_all(
-            "Item",
-            filters={
-                "disabled": 0,
-                "is_sales_item": 1,
-                "item_name": ["like", f"%{search_term}%"]
-            },
-            fields=["name", "item_name", "item_code", "stock_uom", "standard_rate"],
-            limit=10
-        )
-        
-        if exact_matches:
-            return exact_matches
-        
-        # If no exact matches, get all sales items for fuzzy matching
-        all_items = frappe.get_all(
-            "Item",
-            filters={
-                "disabled": 0,
-                "is_sales_item": 1
-            },
-            fields=["name", "item_name", "item_code", "stock_uom", "standard_rate"],
-            limit=100
-        )
-        
-        # Fuzzy match using similarity ratio
-        matches = []
-        search_lower = search_term.lower()
-        
-        for item in all_items:
-            item_name_lower = item['item_name'].lower()
-            
-            # Calculate similarity
-            similarity = SequenceMatcher(None, search_lower, item_name_lower).ratio()
-            
-            # Also check if search term is in item name
-            contains_match = search_lower in item_name_lower
-            
-            if similarity > 0.3 or contains_match:
-                item['similarity'] = similarity
-                matches.append(item)
-        
-        # Sort by similarity (descending)
-        matches.sort(key=lambda x: x['similarity'], reverse=True)
-        
-        return matches[:5]  # Return top 5 matches
-        
-    except Exception as e:
-        frappe.log_error(f"Item search error: {str(e)[:100]}", "Item Search")
-        return []
-
-def find_closest_customer(customer_name):
-    """Find closest customer match"""
-    try:
-        # First try exact match
-        exact_match = frappe.get_all(
-            "Customer",
-            filters={"customer_name": customer_name},
-            fields=["name", "customer_name", "mobile_no"],
-            limit=1
-        )
-        
-        if exact_match:
-            return exact_match[0]
-        
-        # Try fuzzy matching
-        all_customers = frappe.get_all(
-            "Customer",
-            fields=["name", "customer_name", "mobile_no"],
-            limit=100
-        )
-        
-        best_match = None
-        best_similarity = 0
-        customer_lower = customer_name.lower()
-        
-        for customer in all_customers:
-            customer_name_lower = customer['customer_name'].lower()
-            similarity = SequenceMatcher(None, customer_lower, customer_name_lower).ratio()
-            
-            if similarity > 0.7 and similarity > best_similarity:  # High threshold for customer matching
-                best_similarity = similarity
-                best_match = customer
-        
-        return best_match
-        
-    except Exception as e:
-        frappe.log_error(f"Customer search error: {str(e)[:100]}", "Customer Search")
-        return None
-
-# =============================================================================
-# UTILITY FUNCTIONS (Updated)
-# =============================================================================
-
-def create_sales_order(order_data):
-    """Create Sales Order in ERPNext from order data"""
-    try:
-        # Get or create customer
-        if order_data.get('customer'):
-            customer = frappe.get_doc("Customer", order_data['customer'])
+                send_message(phone_number, "❌ Error placing order. Please try again.")
+                
+        elif choice == 2:
+            # Continue shopping
+            show_items_menu(phone_number)
         else:
-            customer = get_or_create_customer(order_data['customer_name'], order_data['customer_phone'])
-        
-        # Parse delivery date
-        delivery_date = parse_delivery_date(order_data.get('delivery_date', 'Today'))
-        
-        # Create Sales Order
-        so = frappe.new_doc("Sales Order")
-        so.customer = customer.name
-        so.transaction_date = datetime.now().date()
-        so.delivery_date = delivery_date
-        so.custom_phone = order_data['customer_phone']
-        so.custom_delivery_address = order_data.get('delivery_address', '')
-        so.custom_whatsapp_order = 1  # Custom field to mark WhatsApp orders
-        
-        # Add items
-        for item_data in order_data['items']:
-            so.append("items", {
-                "item_code": item_data['item_code'],
-                "item_name": item_data['item_name'],
-                "qty": item_data['quantity'],
-                "uom": item_data['uom'],
-                "rate": item_data['rate'],
-                "amount": item_data['amount']
-            })
-        
-        so.flags.ignore_permissions = True
-        so.insert()
-        so.submit()
-        
-        frappe.db.commit()
-        return so
-        
-    except Exception as e:
-        frappe.log_error(f"SO creation error: {str(e)[:100]}", "SO Error")
-        return None
-
-def parse_delivery_date(date_str):
-    """Parse delivery date from various formats"""
-    try:
-        date_str = date_str.lower().strip()
-        today = datetime.now().date()
-        
-        if date_str in ['today', 'now']:
-            return today
-        elif date_str in ['tomorrow']:
-            return today + timedelta(days=1)
-        elif 'next monday' in date_str:
-            days_ahead = 0 - today.weekday()
-            if days_ahead <= 0:
-                days_ahead += 7
-            return today + timedelta(days_ahead)
-        elif 'next week' in date_str:
-            return today + timedelta(days=7)
-        else:
-            # Try to parse date formats
-            for fmt in ['%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%m/%d/%Y']:
-                try:
-                    return datetime.strptime(date_str, fmt).date()
-                except ValueError:
-                    continue
+            send_message(phone_number, "❌ Please choose 1 or 2")
             
-            # Default to today if parsing fails
-            return today
-            
-    except Exception:
-        return datetime.now().date()
+    except ValueError:
+        send_message(phone_number, "❌ Please enter 1 or 2")
 
-def get_or_create_customer(customer_name, phone):
-    """Get existing customer or create new one"""
-    try:
-        # Check if customer exists by phone
-        existing = frappe.get_all("Customer", filters={"mobile_no": phone}, limit=1)
-        
-        if existing:
-            return frappe.get_doc("Customer", existing[0].name)
-        
-        # Create new customer
-        customer = frappe.new_doc("Customer")
-        customer.customer_name = customer_name
-        customer.customer_type = "Individual"
-        customer.customer_group = "Individual"
-        customer.territory = "Uganda"  # Adjust as needed
-        customer.mobile_no = phone
-        customer.flags.ignore_permissions = True
-        customer.insert()
-        
-        return customer
-        
-    except Exception as e:
-        frappe.log_error(f"Customer error: {str(e)[:100]}", "Customer Error")
-        raise e
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
 
 def send_message(phone_number, message):
     """Send WhatsApp message"""
     try:
         if not phone_number.startswith('+'):
-            phone_number = '+' + phone_number
-            
+            phone_number = '+' + str(phone_number)
+        
         client = Client(STATIC_TWILIO_SID, STATIC_TWILIO_TOKEN)
         
         response = client.messages.create(
@@ -748,183 +402,394 @@ def send_message(phone_number, message):
             to=f"whatsapp:{phone_number}"
         )
         
-        frappe.log_error(f"Message sent - SID: {response.sid}", "Message Sent")
+        frappe.log_error(f"Message sent to {phone_number}", "Message Success")
+        return True
         
     except Exception as e:
-        frappe.log_error(f"Send failed: {str(e)[:100]}", "Send Failed")
+        frappe.log_error(f"Send message failed: {str(e)}", "Message Error")
+        return False
 
-def update_session(session, order_data):
-    """Update session with current state and data"""
+def get_user_state(phone_number):
+    """Get user's current state"""
     try:
-        session.order_data = json.dumps(order_data)
-        session.save(ignore_permissions=True)
-        frappe.db.commit()
+        # Try to get from cache first
+        cache_key = f"whatsapp_state_{phone_number}"
+        state = frappe.cache().get_value(cache_key)
+        
+        if state:
+            return state
+        
+        # Fallback to database
+        sessions = frappe.get_all(
+            "WhatsApp Order Session",
+            filters={"phone_number": phone_number, "status": "Active"},
+            fields=["current_state"],
+            order_by="modified desc",
+            limit=1
+        )
+        
+        if sessions:
+            state = sessions[0].current_state
+            frappe.cache().set_value(cache_key, state, expires_in_sec=3600)
+            return state
+        
+        return "START"
+        
     except Exception as e:
-        frappe.log_error(f"Session update: {str(e)[:100]}", "Session Update")
+        frappe.log_error(f"Get state error: {str(e)}", "State Error")
+        return "START"
 
-def reset_conversation(phone_number, session):
-    """Reset conversation to start state"""
+def set_user_state(phone_number, state):
+    """Set user's current state"""
     try:
-        session.current_state = ORDER_STATES['START']
+        # Save to cache
+        cache_key = f"whatsapp_state_{phone_number}"
+        frappe.cache().set_value(cache_key, state, expires_in_sec=3600)
+        
+        # Also try to save to database
+        try:
+            session = get_or_create_session(phone_number)
+            if session:
+                session.current_state = state
+                session.save(ignore_permissions=True)
+                frappe.db.commit()
+        except Exception as e:
+            frappe.log_error(f"DB state save error: {str(e)}", "State DB Error")
+        
+        frappe.log_error(f"State set for {phone_number}: {state}", "State Set")
+        
+    except Exception as e:
+        frappe.log_error(f"Set state error: {str(e)}", "State Error")
+
+def save_temp_data(phone_number, key, data):
+    """Save temporary data"""
+    try:
+        cache_key = f"whatsapp_data_{phone_number}_{key}"
+        frappe.cache().set_value(cache_key, data, expires_in_sec=3600)
+    except Exception as e:
+        frappe.log_error(f"Save temp data error: {str(e)}", "Temp Data Error")
+
+def get_temp_data(phone_number, key):
+    """Get temporary data"""
+    try:
+        cache_key = f"whatsapp_data_{phone_number}_{key}"
+        return frappe.cache().get_value(cache_key)
+    except Exception as e:
+        frappe.log_error(f"Get temp data error: {str(e)}", "Temp Data Error")
+        return None
+
+def add_to_cart(phone_number, item):
+    """Add item to cart"""
+    try:
+        cart = get_temp_data(phone_number, "cart") or []
+        cart.append(item)
+        save_temp_data(phone_number, "cart", cart)
+        frappe.log_error(f"Added to cart for {phone_number}: {item['item_name']}", "Cart Add")
+    except Exception as e:
+        frappe.log_error(f"Add to cart error: {str(e)}", "Cart Error")
+
+def clear_user_data(phone_number):
+    """Clear all user data"""
+    try:
+        # Clear cache
+        keys_to_clear = ["cart", "customer_name", "selected_item", "current_items"]
+        for key in keys_to_clear:
+            cache_key = f"whatsapp_data_{phone_number}_{key}"
+            frappe.cache().delete_value(cache_key)
+        
+        # Reset state
+        set_user_state(phone_number, "START")
+        
+    except Exception as e:
+        frappe.log_error(f"Clear data error: {str(e)}", "Clear Error")
+
+def reset_and_start(phone_number):
+    """Reset user session and start over"""
+    try:
+        clear_user_data(phone_number)
+        handle_main_menu(phone_number, "")
+        frappe.log_error(f"Reset and started for {phone_number}", "Reset")
+    except Exception as e:
+        frappe.log_error(f"Reset error: {str(e)}", "Reset Error")
+
+def get_available_items():
+    """Get available items from database"""
+    try:
+        frappe.log_error("Fetching items from database", "Items Debug")
+        
+        # First, try to get ANY items
+        all_items = frappe.get_all(
+            "Item",
+            filters={"disabled": 0, "is_sales_item": 1},
+            fields=["name", "item_name", "standard_rate", "stock_uom"],
+            limit=20,
+            order_by="item_name asc"
+        )
+        
+        frappe.log_error(f"Found {len(all_items)} total sales items", "Items Debug")
+        
+        # If no items with standard_rate, create some dummy items for testing
+        items_with_price = [item for item in all_items if item.get('standard_rate', 0) > 0]
+        
+        if not items_with_price and all_items:
+            frappe.log_error("No items with standard_rate > 0, adding default prices", "Items Debug")
+            # Add default prices for testing
+            for item in all_items[:5]:
+                item['standard_rate'] = 10000  # Default 10,000 UGX
+            return all_items[:5]
+        
+        if items_with_price:
+            frappe.log_error(f"Found {len(items_with_price)} items with prices", "Items Debug")
+            return items_with_price
+            
+        # If still no items, create test items
+        frappe.log_error("No items found, creating test items", "Items Debug")
+        return [
+            {"name": "TEST001", "item_name": "Test Rice 1kg", "standard_rate": 5000, "stock_uom": "Kg"},
+            {"name": "TEST002", "item_name": "Test Sugar 1kg", "standard_rate": 3000, "stock_uom": "Kg"},
+            {"name": "TEST003", "item_name": "Test Cooking Oil 1L", "standard_rate": 8000, "stock_uom": "Litre"},
+            {"name": "TEST004", "item_name": "Test Bread", "standard_rate": 2000, "stock_uom": "Nos"},
+            {"name": "TEST005", "item_name": "Test Milk 1L", "standard_rate": 4000, "stock_uom": "Litre"}
+        ]
+        
+    except Exception as e:
+        frappe.log_error(f"Get items error: {str(e)}", "Items Error")
+        # Return test items if database fails
+        return [
+            {"name": "TEST001", "item_name": "Test Rice 1kg", "standard_rate": 5000, "stock_uom": "Kg"},
+            {"name": "TEST002", "item_name": "Test Sugar 1kg", "standard_rate": 3000, "stock_uom": "Kg"},
+            {"name": "TEST003", "item_name": "Test Cooking Oil 1L", "standard_rate": 8000, "stock_uom": "Litre"}
+        ]
+
+def get_or_create_session(phone_number):
+    """Get or create session record"""
+    try:
+        # Check if session exists
+        existing = frappe.get_all(
+            "WhatsApp Order Session",
+            filters={"phone_number": phone_number, "status": "Active"},
+            limit=1
+        )
+        
+        if existing:
+            return frappe.get_doc("WhatsApp Order Session", existing[0].name)
+        
+        # Create new session
+        session = frappe.new_doc("WhatsApp Order Session")
+        session.phone_number = phone_number
+        session.current_state = "START"
+        session.status = "Active"
         session.order_data = "{}"
-        session.status = "Reset"
-        session.save(ignore_permissions=True)
-        frappe.db.commit()
-    except Exception as e:
-        frappe.log_error(f"Reset error: {str(e)[:100]}", "Reset Error")
-
-# =============================================================================
-# ADDITIONAL UTILITY FUNCTIONS
-# =============================================================================
-
-def validate_session(doc, method):
-    """Validate session document"""
-    if not doc.phone_number:
-        frappe.throw("Phone number is required")
-    
-    # Normalize phone number
-    doc.phone_number = doc.phone_number.replace('+', '').replace(' ', '').replace('-', '')
-
-def on_session_update(doc, method):
-    """Handle session updates"""
-    if doc.status == "Completed" and not doc.session_ended:
-        doc.session_ended = datetime.now()
-
-def on_sales_order_submit(doc, method):
-    """Handle sales order submission - send confirmation"""
-    if hasattr(doc, 'custom_whatsapp_order') and doc.custom_whatsapp_order:
-        send_order_confirmation(doc)
-
-def send_order_confirmation(sales_order):
-    """Send order confirmation via WhatsApp"""
-    try:
-        phone = sales_order.custom_phone
-        if phone:
-            msg = f"""✅ ORDER CONFIRMED!
-
-📋 Order: {sales_order.name}
-👤 Customer: {sales_order.customer}
-💵 Total: {sales_order.grand_total:,.0f}
-📅 Delivery: {sales_order.delivery_date}
-
-Thank you for your order! 🙏"""
-            
-            send_message(phone.replace('+', ''), msg)
-            
-    except Exception as e:
-        frappe.log_error(f"Confirmation error: {str(e)[:100]}", "Confirmation")
-
-def cleanup_old_sessions():
-    """Clean up old completed sessions"""
-    try:
-        # Delete sessions older than 30 days
-        cutoff_date = datetime.now() - timedelta(days=30)
-        frappe.db.sql("""
-            DELETE FROM `tabWhatsApp Order Session`
-            WHERE status IN ('Completed', 'Cancelled') 
-            AND creation < %s
-        """, cutoff_date)
+        session.flags.ignore_permissions = True
+        session.insert(ignore_permissions=True)
         frappe.db.commit()
         
-    except Exception as e:
-        frappe.log_error(f"Cleanup error: {str(e)[:100]}", "Cleanup")
-
-def cleanup_inactive_sessions():
-    """Clean up inactive sessions (older than 2 hours)"""
-    try:
-        cutoff_time = datetime.now() - timedelta(hours=2)
-        frappe.db.sql("""
-            UPDATE `tabWhatsApp Order Session`
-            SET status = 'Cancelled', session_ended = %s
-            WHERE status = 'Active' 
-            AND modified < %s
-        """, (datetime.now(), cutoff_time))
-        frappe.db.commit()
+        return session
         
     except Exception as e:
-        frappe.log_error(f"Inactive cleanup: {str(e)[:100]}", "Cleanup")
+        frappe.log_error(f"Session creation error: {str(e)}", "Session Error")
+        return None
+
+def create_order(phone_number):
+    """Create sales order from cart"""
+    try:
+        cart = get_temp_data(phone_number, "cart") or []
+        customer_name = get_temp_data(phone_number, "customer_name") or f"WhatsApp Customer {phone_number}"
+        
+        if not cart:
+            return False
+        
+        # Create or get customer
+        customer = get_or_create_customer(customer_name, phone_number)
+        if not customer:
+            return False
+        
+        # Create sales order
+        so = frappe.new_doc("Sales Order")
+        so.customer = customer.name
+        so.transaction_date = datetime.now().date()
+        so.delivery_date = datetime.now().date() + timedelta(days=1)
+        
+        # Add items
+        for item in cart:
+            so.append("items", {
+                "item_code": item['item_code'],
+                "item_name": item['item_name'],
+                "qty": item['qty'],
+                "rate": item['rate'],
+                "amount": item['total']
+            })
+        
+        so.flags.ignore_permissions = True
+        so.insert(ignore_permissions=True)
+        frappe.db.commit()
+        
+        frappe.log_error(f"Order created: {so.name} for {phone_number}", "Order Success")
+        return True
+        
+    except Exception as e:
+        frappe.log_error(f"Create order error: {str(e)}", "Order Error")
+        return False
+
+def get_or_create_customer(customer_name, phone_number):
+    """Get or create customer"""
+    try:
+        # Check existing
+        existing = frappe.get_all(
+            "Customer",
+            filters={"mobile_no": phone_number},
+            limit=1
+        )
+        
+        if existing:
+            return frappe.get_doc("Customer", existing[0].name)
+        
+        # Create new
+        customer = frappe.new_doc("Customer")
+        customer.customer_name = customer_name
+        customer.customer_type = "Individual"
+        customer.customer_group = "Individual"
+        customer.territory = "All Territories"
+        customer.mobile_no = phone_number
+        
+        customer.flags.ignore_permissions = True
+        customer.insert(ignore_permissions=True)
+        frappe.db.commit()
+        
+        return customer
+        
+    except Exception as e:
+        frappe.log_error(f"Customer creation error: {str(e)}", "Customer Error")
+        return None
+
+# =============================================================================
+# DIAGNOSTIC FUNCTIONS
+# =============================================================================
 
 @frappe.whitelist()
-def test_chatbot(phone_number):
-    """Test the chatbot system"""
+def check_items_debug():
+    """Check what items are available in the system"""
     try:
-        if not phone_number.startswith('+'):
-            phone_number = '+' + phone_number
+        # Count all items
+        total_items = frappe.db.count("Item")
         
-        # Send welcome message
-        welcome_msg = """🤖 CHATBOT TEST
-
-Hi! This is a test of our WhatsApp ordering system.
-
-Type 'HELLO' to start placing an order!"""
+        # Count sales items
+        sales_items = frappe.db.count("Item", filters={"is_sales_item": 1, "disabled": 0})
         
-        send_message(phone_number.replace('+', ''), welcome_msg)
+        # Count items with prices
+        items_with_price = frappe.db.count("Item", filters={
+            "is_sales_item": 1, 
+            "disabled": 0,
+            "standard_rate": [">", 0]
+        })
+        
+        # Get sample items
+        sample_items = frappe.get_all(
+            "Item",
+            filters={"disabled": 0, "is_sales_item": 1},
+            fields=["name", "item_name", "standard_rate", "stock_uom", "disabled", "is_sales_item"],
+            limit=10
+        )
+        
+        return {
+            "total_items": total_items,
+            "sales_items": sales_items,
+            "items_with_price": items_with_price,
+            "sample_items": sample_items
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+@frappe.whitelist()
+def create_test_items():
+    """Create test items for the chatbot"""
+    try:
+        test_items = [
+            {"item_name": "Test Rice 5kg", "standard_rate": 15000, "stock_uom": "Kg"},
+            {"item_name": "Test Sugar 2kg", "standard_rate": 8000, "stock_uom": "Kg"},
+            {"item_name": "Test Cooking Oil 2L", "standard_rate": 12000, "stock_uom": "Litre"},
+            {"item_name": "Test Bread Loaf", "standard_rate": 3000, "stock_uom": "Nos"},
+            {"item_name": "Test Fresh Milk 1L", "standard_rate": 5000, "stock_uom": "Litre"}
+        ]
+        
+        created_items = []
+        
+        for item_data in test_items:
+            # Check if item already exists
+            if frappe.db.exists("Item", {"item_name": item_data["item_name"]}):
+                continue
+                
+            # Create new item
+            item = frappe.new_doc("Item")
+            item.item_name = item_data["item_name"]
+            item.item_code = item_data["item_name"].replace(" ", "_").upper()
+            item.item_group = "Products"  # Default group
+            item.stock_uom = item_data["stock_uom"]
+            item.is_sales_item = 1
+            item.is_stock_item = 1
+            item.standard_rate = item_data["standard_rate"]
+            item.disabled = 0
+            
+            try:
+                item.flags.ignore_permissions = True
+                item.insert(ignore_permissions=True)
+                created_items.append(item.name)
+                frappe.log_error(f"Created test item: {item.name}", "Test Item Created")
+            except Exception as e:
+                frappe.log_error(f"Failed to create {item.item_name}: {str(e)}", "Item Creation Error")
+        
+        frappe.db.commit()
         
         return {
             "status": "success",
-            "message": f"Test message sent to {phone_number}",
-            "instructions": "Reply 'HELLO' to start the ordering process"
+            "created_items": created_items,
+            "message": f"Created {len(created_items)} test items"
         }
         
     except Exception as e:
         return {
             "status": "error",
-            "message": f"Test failed: {str(e)}"
+            "message": str(e)
         }
 
 @frappe.whitelist()
-def get_session_info(phone_number):
-    """Get current session information for debugging"""
+def test_chatbot(phone_number):
+    """Test the simplified chatbot"""
     try:
-        session = get_user_session(phone_number.replace('+', ''))
-        order_data = json.loads(session.order_data or "{}")
+        phone_number = str(phone_number).replace('+', '')
+        
+        # Reset and start
+        reset_and_start(phone_number)
         
         return {
-            "phone_number": session.phone_number,
-            "current_state": session.current_state,
-            "order_data": order_data,
-            "status": getattr(session, 'status', 'Unknown')
+            "status": "success",
+            "message": f"Test message sent to +{phone_number}. Check WhatsApp and reply with a number!"
         }
         
     except Exception as e:
         return {
-            "error": str(e)
+            "status": "error",
+            "message": str(e)
         }
 
 @frappe.whitelist()
-def get_order_status(order_name):
-    """Get order status for Jinja templates"""
+def debug_user_state(phone_number):
+    """Debug user state"""
     try:
-        order = frappe.get_doc("Sales Order", order_name)
-        return order.status
-    except:
-        return "Unknown"
-
-@frappe.whitelist()
-def manual_item_search(search_term):
-    """Manual item search for testing"""
-    try:
-        results = search_items(search_term)
+        phone_number = str(phone_number).replace('+', '')
+        
+        state = get_user_state(phone_number)
+        cart = get_temp_data(phone_number, "cart") or []
+        customer_name = get_temp_data(phone_number, "customer_name")
+        
         return {
-            "search_term": search_term,
-            "results": results,
-            "count": len(results)
+            "phone_number": phone_number,
+            "current_state": state,
+            "cart_items": len(cart),
+            "customer_name": customer_name,
+            "cart_details": cart
         }
+        
     except Exception as e:
-        return {
-            "error": str(e)
-        }
-
-@frappe.whitelist()
-def manual_customer_search(customer_name):
-    """Manual customer search for testing"""
-    try:
-        result = find_closest_customer(customer_name)
-        return {
-            "search_term": customer_name,
-            "result": result
-        }
-    except Exception as e:
-        return {
-            "error": str(e)
-        }
+        return {"error": str(e)}
