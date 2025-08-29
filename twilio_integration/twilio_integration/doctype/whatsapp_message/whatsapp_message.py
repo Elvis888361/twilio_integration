@@ -51,7 +51,7 @@ class WhatsAppMessage(Document):
 			message.send()
 
 	def store_whatsapp_message(to, message, doctype=None, docname=None, media=None):
-		sender = frappe.db.get_single_value('Twilio Settings', 'whatsapp_no')
+		sender = frappe.db.get_single_value('whatsapp integration settings', 'twilio_number')
 		wa_msg = frappe.get_doc({
 				'doctype': 'WhatsApp Message',
 				'from_': 'whatsapp:{}'.format(sender),
