@@ -107,12 +107,12 @@ class Twilio:
 
 	@classmethod
 	def get_twilio_client(self):
-		twilio_settings = frappe.get_doc("Twilio Settings")
+		twilio_settings = frappe.get_doc("whatsapp integration settings")
 		if not twilio_settings.enabled:
 			frappe.throw(_("Please enable twilio settings before sending WhatsApp messages"))
 		
 		auth_token = get_decrypted_password("Twilio Settings", "Twilio Settings", 'auth_token')
-		client = TwilioClient(twilio_settings.account_sid, auth_token)
+		client = TwilioClient(twilio_settings.twilio_sid, twilio_settings.twilio_token)
 
 		return client
 
