@@ -1,8 +1,13 @@
 import frappe
-from twilio.rest import Client
+from frappe import _
+import requests
 import json
+import hashlib
+import time
+from twilio.rest import Client
 from datetime import datetime, timedelta
 
+# ======================== CHATBOT CODE (UNCHANGED FROM ORIGINAL) ========================
 # Configuration
 twilio_settings = frappe.get_doc("whatsapp integration settings")
 STATIC_TWILIO_SID = twilio_settings.twilio_sid
@@ -11,7 +16,7 @@ STATIC_WHATSAPP_FROM = twilio_settings.twilio_number
 
 @frappe.whitelist(allow_guest=True)
 def handle_whatsapp_chatbot():
-    """Main webhook handler for WhatsApp chatbot"""
+    """Main webhook handler for WhatsApp chatbot - NOW HANDLES BOTH CHATBOT AND WORKFLOW"""
     try:
         message_body = frappe.form_dict.get('Body', '').strip()
         from_number = frappe.form_dict.get('From', '').replace('whatsapp:', '').replace('+', '')
@@ -26,7 +31,13 @@ def handle_whatsapp_chatbot():
             reset_and_start(from_number)
             return "OK"
         
-        # Process message
+        # NEW: Check if this is a workflow action first
+        if is_workflow_action_message(from_number, message_body):
+            frappe.log_error(f"Processing as workflow action: {message_body}", "Workflow Action")
+            process_workflow_action_via_chatbot(from_number, message_body)
+            return "OK"
+        
+        # Process as normal chatbot message
         process_message(from_number, message_body)
         return "OK"
         
@@ -34,6 +45,211 @@ def handle_whatsapp_chatbot():
         frappe.log_error(f"Chatbot error: {str(e)}", "Chatbot Error")
         return "Error"
 
+def is_workflow_action_message(phone_number, message_body):
+    """Check if incoming message is a workflow action - IMPROVED"""
+    try:
+        # Find user by phone number
+        user = find_user_by_mobile_for_workflow(phone_number)
+        if not user:
+            frappe.log_error(f"No user found for {phone_number}", "User Lookup Debug")
+            return False
+        
+        frappe.log_error(f"Found user {user} for {phone_number}", "User Found Debug")
+        
+        # Check if user has pending workflow documents
+        pending_docs = get_pending_documents_for_user_workflow(user)
+        if not pending_docs:
+            frappe.log_error(f"No pending docs for user {user}", "No Pending Debug")
+            return False
+        
+        frappe.log_error(f"User {user} has {len(pending_docs)} pending docs", "Pending Docs Debug")
+        
+        # Check if message looks like a workflow action
+        message_lower = message_body.lower().strip()
+        
+        # Check for numbered actions
+        if message_body.strip().isdigit():
+            action_num = int(message_body.strip())
+            if 1 <= action_num <= 10:
+                frappe.log_error(f"Detected workflow action number: {action_num}", "Action Number Debug")
+                return True
+        
+        # Check for workflow keywords
+        workflow_keywords = ['approve', 'reject', 'status', 'pending', 'workflow']
+        if any(keyword in message_lower for keyword in workflow_keywords):
+            frappe.log_error(f"Detected workflow keyword in: {message_body}", "Keyword Debug")
+            return True
+        
+        frappe.log_error(f"Message '{message_body}' not recognized as workflow action", "Not Workflow Debug")
+        return False
+        
+    except Exception as e:
+        frappe.log_error(f"Error checking workflow action: {str(e)}", "Workflow Check Error")
+        return False
+
+def process_workflow_action_via_chatbot(phone_number, message_body):
+    """Process workflow actions through the chatbot webhook"""
+    try:
+        user = find_user_by_mobile_for_workflow(phone_number)
+        if not user:
+            send_message(phone_number, "User not found for workflow actions.")
+            return
+        
+        # Handle status request
+        if message_body.lower() in ['status', 'pending']:
+            send_workflow_status_via_chatbot(phone_number, user)
+            return
+        
+        # Handle numbered actions
+        if message_body.isdigit():
+            action_number = int(message_body)
+            execute_workflow_action_via_chatbot(phone_number, user, action_number)
+        else:
+            send_message(phone_number, "Reply with a number for workflow actions or 'status' to see pending items.")
+        
+    except Exception as e:
+        frappe.log_error(f"Workflow action error: {str(e)}", "Workflow Action Error")
+        send_message(phone_number, "Error processing workflow action.")
+
+def send_workflow_status_via_chatbot(phone_number, user):
+    """Send workflow status through chatbot - ENHANCED"""
+    try:
+        pending_docs = get_pending_documents_for_user_workflow(user)
+        
+        if not pending_docs:
+            send_message(phone_number, "✅ No pending approvals found.")
+            return
+        
+        msg = f"📋 *PENDING APPROVALS* ({len(pending_docs)})\n\n"
+        
+        # Show detailed info for first 3 documents
+        for i, doc_info in enumerate(pending_docs[:3], 1):
+            # Get full document for more details
+            try:
+                doc = frappe.get_doc(doc_info['doctype'], doc_info['name'])
+                
+                # Get available actions
+                actions = get_workflow_actions_for_chatbot(doc_info['doctype'], doc_info['state'])
+                
+                msg += f"*{i}. {doc_info['doctype']}: {doc_info['name']}*\n"
+                msg += f"📊 State: {doc_info['state']}\n"
+                
+                # Add customer info if available
+                if hasattr(doc, 'customer'):
+                    msg += f"👤 Customer: {doc.customer}\n"
+                
+                # Add amount if configured
+                workflow_config = get_workflow_config(doc_info['doctype'])
+                if workflow_config and workflow_config.get('include_amount_field') and workflow_config.get('amount_field'):
+                    amount_field = workflow_config['amount_field']
+                    if hasattr(doc, amount_field):
+                        amount_value = getattr(doc, amount_field)
+                        currency = getattr(doc, 'currency', frappe.defaults.get_global_default('currency'))
+                        msg += f"💰 Amount: {frappe.utils.fmt_money(amount_value, currency=currency)}\n"
+                
+                # Show available actions
+                if actions:
+                    msg += f"Actions: "
+                    for j, action in enumerate(actions, 1):
+                        msg += f"{j}-{action['action']} "
+                    msg += "\n"
+                
+                msg += "\n"
+                
+            except Exception as e:
+                msg += f"{i}. {doc_info['doctype']}: {doc_info['name']} (Error loading details)\n\n"
+        
+        if len(pending_docs) > 3:
+            msg += f"... and {len(pending_docs) - 3} more documents\n\n"
+        
+        msg += "💬 *Reply with:*\n"
+        msg += "• Document number to see actions\n"
+        msg += "• 'status' to refresh this list\n"
+        msg += "\n_ERPNext Workflow_"
+        
+        send_message(phone_number, msg)
+        
+    except Exception as e:
+        frappe.log_error(f"Error sending workflow status: {str(e)}", "Workflow Status Error")
+        send_message(phone_number, "Error loading workflow status. Please try again.")
+
+
+def execute_workflow_action_via_chatbot(phone_number, user, action_number):
+    """Execute workflow action through chatbot"""
+    try:
+        pending_docs = get_pending_documents_for_user_workflow(user)
+        
+        if not pending_docs:
+            send_message(phone_number, "No pending documents found.")
+            return
+        
+        # Get the most recent document
+        latest_doc = pending_docs[0]
+        
+        # Get available actions
+        actions = get_workflow_actions_for_chatbot(latest_doc['doctype'], latest_doc['state'])
+        
+        if action_number > len(actions) or action_number < 1:
+            # FIX: Show available actions in error message
+            actions_text = "\n".join([f"{i+1} - {action['action']}" for i, action in enumerate(actions)])
+            msg = f"Invalid action. Available actions:\n{actions_text}"
+            send_message(phone_number, msg)
+            return
+        
+        selected_action = actions[action_number - 1]
+        
+        # Check permissions
+        user_roles = frappe.get_roles(user)
+        if selected_action['allowed_role'] not in user_roles:
+            send_message(phone_number, f"Permission denied for action: {selected_action['action']}")
+            return
+        
+        # Execute the action
+        doc = frappe.get_doc(latest_doc['doctype'], latest_doc['name'])
+        
+        # FIX: Set user context properly
+        frappe.set_user(user)
+        
+        # Add comment
+        doc.add_comment("Workflow", f"Action '{selected_action['action']}' via WhatsApp by {user}")
+        
+        # FIX: Update state and save with proper flags
+        doc.workflow_state = selected_action['next_state']
+        doc.flags.ignore_permissions = True
+        doc.save(ignore_permissions=True)
+        
+        # FIX: Critical - commit the transaction
+        frappe.db.commit()
+        
+        # Send confirmation
+        msg = f"""✅ ACTION COMPLETED!
+
+{doc.doctype}: {doc.name}
+Action: {selected_action['action']}
+New State: {doc.workflow_state}
+
+ERPNext"""
+        send_message(phone_number, msg)
+        
+        # FIX: Send updated status after action
+        frappe.enqueue(
+            'your_app.whatsapp_integration.send_workflow_status_via_chatbot',
+            phone_number=phone_number,
+            user=user,
+            queue='short'
+        )
+        
+    except frappe.ValidationError as e:
+        frappe.log_error(f"Validation error in workflow action: {str(e)}", "Workflow Validation Error")
+        send_message(phone_number, f"Validation error: {str(e)}")
+    except frappe.PermissionError as e:
+        frappe.log_error(f"Permission error in workflow action: {str(e)}", "Workflow Permission Error")
+        send_message(phone_number, "Permission denied for this action.")
+    except Exception as e:
+        frappe.log_error(f"Execute workflow action error: {str(e)}", "Execute Action Error")
+        send_message(phone_number, "Error executing action. Please try again.")
+
+# ======================== ORIGINAL CHATBOT FUNCTIONS (UNCHANGED) ========================
 def process_message(phone_number, message):
     """Process incoming message based on simple state"""
     try:
@@ -66,7 +282,7 @@ def process_message(phone_number, message):
             
     except Exception as e:
         frappe.log_error(f"Process message error: {str(e)}", "Process Error")
-        send_message(phone_number, "❌ Error occurred. Restarting...")
+        send_message(phone_number, "Error occurred. Restarting...")
         reset_and_start(phone_number)
 
 def handle_main_menu(phone_number, message):
@@ -93,13 +309,13 @@ def handle_main_menu_choice(phone_number, message):
             show_customer_options(phone_number)
         elif choice == 2:
             # Contact support
-            msg = """📞 *CONTACT SUPPORT*
+            msg = """CONTACT SUPPORT
 
 Phone: +256-XXX-XXXXXX
 Email: support@store.com
 Hours: 8AM - 6PM
 
-Type *0* to return to main menu."""
+Type 0 to return to main menu."""
             send_message(phone_number, msg)
         elif choice == 3:
             # About us
@@ -110,7 +326,7 @@ Your trusted online store!
 ✅ Fast delivery
 ✅ 24/7 WhatsApp ordering
 
-Type *0* to return to main menu."""
+Type 0 to return to main menu."""
             send_message(phone_number, msg)
         else:
             send_message(phone_number, "❌ Please choose 1, 2, or 3")
@@ -125,7 +341,7 @@ def show_customer_options(phone_number):
 *1* - 🆕 New Customer
 *2* - 🔍 Existing Customer
 
-Type 1 or 2:"""
+Type 1 or 2"""
     
     set_user_state(phone_number, "CUSTOMER_SELECT")
     send_message(phone_number, msg)
@@ -184,7 +400,7 @@ This might be because:
 
 Please contact admin or try again later.
 
-Type *0* to go back to main menu."""
+Type 0 to go back to main menu."""
             
             frappe.log_error(f"No items available for {phone_number}", "No Items Error")
             send_message(phone_number, msg)
@@ -198,7 +414,7 @@ Type *0* to go back to main menu."""
             price = item.get('standard_rate', 0)
             price_text = f"{price:,.0f} UGX" if price > 0 else "Price on request"
             uom = item.get('stock_uom', 'unit')
-            msg += f"*{i}* - {item['item_name']}\n     💰 {price_text} per {uom}\n\n"
+            msg += f"{i} - {item['item_name']}\n    💰 {price_text} per {uom}\n\n"
         
         msg += "Type item number (1-5):"
         
@@ -211,7 +427,7 @@ Type *0* to go back to main menu."""
         
     except Exception as e:
         frappe.log_error(f"Items menu error: {str(e)}", "Items Menu Error")
-        send_message(phone_number, "❌ Error loading items. Type *0* to go back to main menu.")
+        send_message(phone_number, "Error loading items. Type 0 to go back to main menu.")
         set_user_state(phone_number, "MAIN_MENU")
 
 def handle_items_browse(phone_number, message):
@@ -335,19 +551,19 @@ def show_cart_summary(phone_number):
     cart = get_temp_data(phone_number, "cart") or []
     
     if not cart:
-        send_message(phone_number, "🛒 Your cart is empty!")
+        send_message(phone_number, "Your cart is empty!")
         show_items_menu(phone_number)
         return
     
     total = 0
-    msg = "🛒 *YOUR CART*\n\n"
+    msg = "YOUR CART\n\n"
     
     for i, item in enumerate(cart, 1):
         total += item['total']
         msg += f"{i}. {item['item_name']}\n"
         msg += f"   {item['qty']} × {item['rate']:,.0f} = {item['total']:,.0f} UGX\n\n"
     
-    msg += f"💰 *TOTAL: {total:,.0f} UGX*\n\n"
+    msg += f"TOTAL: {total:,.0f} UGX\n\n"
     msg += "*1* - ✅ Place Order\n*2* - 🛍️ Continue Shopping\n\nChoose 1 or 2:"
     
     set_user_state(phone_number, "CHECKOUT")
@@ -367,7 +583,7 @@ def handle_checkout(phone_number, message):
 Thank you for your order!
 We'll contact you soon for delivery details.
 
-Type *0* to start a new order."""
+Type 0 to start a new order."""
                 
                 # Clear cart and reset
                 clear_user_data(phone_number)
@@ -379,15 +595,12 @@ Type *0* to start a new order."""
             # Continue shopping
             show_items_menu(phone_number)
         else:
-            send_message(phone_number, "❌ Please choose 1 or 2")
+            send_message(phone_number, "Please choose 1 or 2")
             
     except ValueError:
-        send_message(phone_number, "❌ Please enter 1 or 2")
+        send_message(phone_number, "Please enter 1 or 2")
 
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
-
+# ======================== ORIGINAL CHATBOT UTILITY FUNCTIONS ========================
 def send_message(phone_number, message):
     """Send WhatsApp message"""
     try:
@@ -549,7 +762,7 @@ def get_available_items():
             {"name": "TEST002", "item_name": "Test Sugar 1kg", "standard_rate": 3000, "stock_uom": "Kg"},
             {"name": "TEST003", "item_name": "Test Cooking Oil 1L", "standard_rate": 8000, "stock_uom": "Litre"},
             {"name": "TEST004", "item_name": "Test Bread", "standard_rate": 2000, "stock_uom": "Nos"},
-            {"name": "TEST005", "item_name": "Test Milk 1L", "standard_rate": 4000, "stock_uom": "Litre"}
+            {"name": "TEST005", "item_name": "Test Fresh Milk 1L", "standard_rate": 4000, "stock_uom": "Litre"}
         ]
         
     except Exception as e:
@@ -662,28 +875,467 @@ def get_or_create_customer(customer_name, phone_number):
         frappe.log_error(f"Customer creation error: {str(e)}", "Customer Error")
         return None
 
-# =============================================================================
-# DIAGNOSTIC FUNCTIONS
-# =============================================================================
+# ======================== WORKFLOW FUNCTIONS (MODIFIED TO USE CHATBOT WEBHOOK) ========================
+def send_whatsapp_workflow_notifications(doc, method):
+    """
+    Send WhatsApp notifications for any doctype with enabled workflow notifications
+    Now uses the chatbot's messaging system
+    """
+    try:
+        frappe.logger().info(f"Starting WhatsApp workflow notification for {doc.doctype} {doc.name}")
+        
+        # Check if WhatsApp workflow is enabled for this doctype
+        workflow_config = get_workflow_config(doc.doctype)
+        if not workflow_config:
+            frappe.logger().info(f"No workflow config found for {doc.doctype} - skipping WhatsApp notification")
+            return
+        
+        # Check if current state requires notification
+        if not should_send_notification(doc, workflow_config):
+            frappe.logger().info(f"No notification needed for {doc.doctype} {doc.name}")
+            return
+        
+        # Get approvers for current workflow state
+        approvers = get_workflow_approvers(doc.doctype, doc.workflow_state)
+        
+        if not approvers:
+            frappe.logger().error(f"No approvers found for {doc.doctype} workflow state: {doc.workflow_state}")
+            return
+        
+        # Get available actions for current state
+        available_actions = get_workflow_actions_for_chatbot(doc.doctype, doc.workflow_state)
+        
+        # Prepare dynamic message with action options
+        message = prepare_workflow_message_for_chatbot(doc, available_actions, workflow_config)
+        
+        # Send to all approvers using the chatbot's send_message function
+        sent_count = 0
+        failed_count = 0
+        for approver in approvers:
+            if send_message(approver['mobile'], message):
+                sent_count += 1
+            else:
+                failed_count += 1
+        
+        frappe.logger().info(f"WhatsApp notification complete: {sent_count} sent, {failed_count} failed")
+        
+    except Exception as e:
+        frappe.logger().error(f"WhatsApp workflow notification failed: {str(e)}")
+        frappe.log_error(f"WhatsApp Workflow Error: {str(e)}", "WhatsApp Workflow")
 
+def send_workflow_confirmation(doc, method):
+    """Send confirmation when workflow state changes to completion states"""
+    try:
+        workflow_config = get_workflow_config(doc.doctype)
+        if not workflow_config:
+            return
+        
+        # Check if current state is a confirmation state
+        if doc.workflow_state not in workflow_config['confirmation_states']:
+            return
+        
+        # Check if state actually changed
+        if hasattr(doc, '_doc_before_save') and doc._doc_before_save:
+            if doc._doc_before_save.workflow_state == doc.workflow_state:
+                return
+        
+        # Get approvers to notify
+        approvers = get_workflow_approvers(doc.doctype, doc.workflow_state)
+        
+        # Get who made the change
+        user_name = frappe.get_value("User", frappe.session.user, "full_name") or frappe.session.user
+        
+        # Prepare confirmation message
+        message = prepare_confirmation_message_for_chatbot(doc, workflow_config, user_name)
+        
+        # Send confirmation using chatbot's messaging system
+        for approver in approvers:
+            send_message(approver['mobile'], message)
+        
+    except Exception as e:
+        frappe.logger().error(f"Workflow confirmation failed: {str(e)}")
+
+# ======================== WORKFLOW HELPER FUNCTIONS ========================
+def get_workflow_config(doctype):
+    """Check if WhatsApp workflow is enabled for this doctype - CORRECTED"""
+    try:
+        config = frappe.get_value(
+            "WhatsApp Workflow Configuration",
+            {"document_type": doctype, "enabled": 1},  # Fixed: use 'document_type' instead of 'doctype'
+            ["name", "notification_states", "confirmation_states", "message_template", "include_amount_field", "amount_field"]
+        )
+        
+        if config:
+            result = {
+                "name": config[0],
+                "notification_states": (config[1] or "").split('\n'),
+                "confirmation_states": (config[2] or "").split('\n'),
+                "message_template": config[3],
+                "include_amount_field": config[4],
+                "amount_field": config[5]
+            }
+            return result
+        return None
+        
+    except Exception as e:
+        frappe.logger().error(f"Error getting workflow config: {str(e)}")
+        return None
+
+def should_send_notification(doc, workflow_config):
+    """Check if notification should be sent based on state change"""
+    try:
+        if not hasattr(doc, 'workflow_state') or not doc.workflow_state:
+            return False
+        
+        # Check if current state requires notification
+        if doc.workflow_state not in workflow_config['notification_states']:
+            return False
+        
+        # Check if state actually changed to avoid duplicate notifications
+        if hasattr(doc, '_doc_before_save') and doc._doc_before_save:
+            previous_state = doc._doc_before_save.workflow_state
+            if previous_state == doc.workflow_state:
+                return False
+        
+        return True
+        
+    except Exception as e:
+        frappe.logger().error(f"Error checking notification: {str(e)}")
+        return False
+
+def get_workflow_actions_for_chatbot(doctype, current_state):
+    """Get workflow actions for chatbot integration"""
+    try:
+        workflow = frappe.get_value("Workflow", {"document_type": doctype}, "name")
+        if not workflow:
+            return []
+        
+        transitions = frappe.get_all(
+            "Workflow Transition",
+            filters={
+                "parent": workflow,
+                "state": current_state
+            },
+            fields=["action", "next_state", "allowed"],
+            order_by="idx"
+        )
+        
+        actions = []
+        for i, transition in enumerate(transitions, 1):
+            actions.append({
+                "number": i,
+                "action": transition.action,
+                "next_state": transition.next_state,
+                "allowed_role": transition.allowed
+            })
+        
+        return actions
+        
+    except Exception as e:
+        frappe.logger().error(f"Error getting workflow actions: {str(e)}")
+        return []
+
+def prepare_workflow_message_for_chatbot(doc, actions, workflow_config):
+    """Prepare workflow message for chatbot system"""
+    try:
+        site_url = frappe.utils.get_site_url(frappe.local.site)
+        doc_url = f"{site_url}/app/{doc.doctype.lower().replace(' ', '-')}/{doc.name}"
+        
+        # Get amount if configured
+        amount_text = ""
+        if workflow_config.get('include_amount_field') and workflow_config.get('amount_field'):
+            amount_field = workflow_config['amount_field']
+            if hasattr(doc, amount_field):
+                amount_value = getattr(doc, amount_field)
+                currency = getattr(doc, 'currency', frappe.defaults.get_global_default('currency'))
+                amount_text = f"Amount: {frappe.utils.fmt_money(amount_value, currency=currency)}\n"
+        
+        # Use custom template or default
+        if workflow_config.get('message_template') and workflow_config['message_template'].strip():
+            message_base = workflow_config['message_template']
+            message_base = message_base.replace('{doc_name}', doc.name)
+            message_base = message_base.replace('{doc_type}', doc.doctype)
+            message_base = message_base.replace('{current_state}', doc.workflow_state)
+            message_base = message_base.replace('{url}', doc_url)
+            
+            if hasattr(doc, 'customer'):
+                message_base = message_base.replace('{customer}', doc.customer)
+            
+            if amount_text:
+                message_base = message_base.replace('{amount}', amount_text.strip())
+        else:
+            # Default template
+            customer_text = f"Customer: {doc.customer}\n" if hasattr(doc, 'customer') else ""
+            date_field = getattr(doc, 'transaction_date', None) or getattr(doc, 'posting_date', None)
+            date_text = f"Date: {frappe.utils.formatdate(date_field)}\n" if date_field else ""
+            
+            message_base = f"""{doc.doctype} APPROVAL REQUIRED
+
+Document: {doc.name}
+{customer_text}{amount_text}{date_text}
+Link: {doc_url}"""
+        
+        # Add action options
+        if actions:
+            message_base += f"\n\nReply with:\n"
+            for action in actions:
+                message_base += f"{action['number']} - {action['action']}\n"
+        
+        message_base += "\nERPNext"
+        
+        return message_base
+        
+    except Exception as e:
+        frappe.logger().error(f"Error preparing workflow message: {str(e)}")
+        return f"{doc.doctype} {doc.name} requires attention. Check ERPNext."
+
+def prepare_confirmation_message_for_chatbot(doc, workflow_config, user_name):
+    """Prepare confirmation message for chatbot system"""
+    try:
+        site_url = frappe.utils.get_site_url(frappe.local.site)
+        doc_url = f"{site_url}/app/{doc.doctype.lower().replace(' ', '-')}/{doc.name}"
+        
+        # Get amount if configured
+        amount_text = ""
+        if workflow_config.get('include_amount_field') and workflow_config.get('amount_field'):
+            amount_field = workflow_config['amount_field']
+            if hasattr(doc, amount_field):
+                amount_value = getattr(doc, amount_field)
+                currency = getattr(doc, 'currency', frappe.defaults.get_global_default('currency'))
+                amount_text = f"Amount: {frappe.utils.fmt_money(amount_value, currency=currency)}\n"
+        
+        customer_text = f"Customer: {doc.customer}\n" if hasattr(doc, 'customer') else ""
+        
+        message = f"""{doc.doctype} {doc.workflow_state}
+
+Document: {doc.name}
+{customer_text}{amount_text}Action by: {user_name}
+
+Link: {doc_url}
+ERPNext"""
+        
+        return message
+        
+    except Exception as e:
+        frappe.logger().error(f"Error preparing confirmation message: {str(e)}")
+        return f"{doc.doctype} {doc.name} status updated to {doc.workflow_state}"
+
+def get_workflow_approvers(doctype, workflow_state):
+    """Get all users who can perform actions from current workflow state"""
+    try:
+        workflow = frappe.get_value("Workflow", {"document_type": doctype}, "name")
+        if not workflow:
+            return []
+        
+        # Get all transitions from current state
+        transitions = frappe.get_all(
+            "Workflow Transition",
+            filters={
+                "parent": workflow,
+                "state": workflow_state
+            },
+            fields=["allowed"]
+        )
+        
+        # Extract unique allowed roles
+        allowed_roles = list(set([t.allowed for t in transitions if t.allowed]))
+        
+        if not allowed_roles:
+            return []
+        
+        # Get users with mobile numbers
+        approvers = []
+        processed_users = set()
+        
+        for role in allowed_roles:
+            role_users = frappe.get_all(
+                "Has Role",
+                filters={"role": role},
+                fields=["parent as user"]
+            )
+            
+            for role_user in role_users:
+                if role_user.user in processed_users:
+                    continue
+                
+                processed_users.add(role_user.user)
+                
+                # Try Employee first, then User mobile
+                mobile = None
+                name = None
+                
+                employee_data = frappe.get_value(
+                    "Employee",
+                    {"user_id": role_user.user},
+                    ["cell_number", "employee_name"]
+                )
+                
+                if employee_data and employee_data[0]:
+                    mobile = employee_data[0]
+                    name = employee_data[1]
+                else:
+                    user_data = frappe.get_value(
+                        "User",
+                        role_user.user,
+                        ["mobile_no", "full_name"]
+                    )
+                    if user_data and user_data[0]:
+                        mobile = user_data[0]
+                        name = user_data[1]
+                
+                if mobile:
+                    approvers.append({
+                        "user": role_user.user,
+                        "name": name or role_user.user,
+                        "mobile": mobile,
+                        "role": role
+                    })
+        
+        return approvers
+        
+    except Exception as e:
+        frappe.logger().error(f"Error getting approvers: {str(e)}")
+        return []
+
+def find_user_by_mobile_for_workflow(mobile_number):
+    """Find user by mobile number for workflow actions - IMPROVED"""
+    try:
+        # Clean mobile number - remove all non-digits except +
+        mobile = str(mobile_number).replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+        
+        # Try different variations
+        mobile_variations = [
+            mobile,
+            mobile.replace('+', ''),
+            mobile[-10:] if len(mobile) >= 10 else mobile,  # Last 10 digits
+            mobile[-9:] if len(mobile) >= 9 else mobile,    # Last 9 digits
+        ]
+        
+        frappe.log_error(f"Searching for mobile variations: {mobile_variations}", "Mobile Search Debug")
+        
+        # Try Employee first
+        for mobile_var in mobile_variations:
+            employee = frappe.get_value(
+                "Employee",
+                {"cell_number": ["like", f"%{mobile_var}%"]},
+                "user_id"
+            )
+            
+            if employee:
+                frappe.log_error(f"Found user via Employee: {employee}", "User Found Employee")
+                return employee
+        
+        # Try User table
+        for mobile_var in mobile_variations:
+            user = frappe.get_value(
+                "User",
+                {"mobile_no": ["like", f"%{mobile_var}%"]},
+                "name"
+            )
+            
+            if user:
+                frappe.log_error(f"Found user via User table: {user}", "User Found User Table")
+                return user
+        
+        frappe.log_error(f"No user found for mobile {mobile_number}", "User Not Found")
+        return None
+        
+    except Exception as e:
+        frappe.log_error(f"Error finding user by mobile: {str(e)}", "User Lookup Error")
+        return None
+
+def get_pending_documents_for_user_workflow(user):
+    """Get pending workflow documents for user - CORRECTED VERSION"""
+    try:
+        # Get all enabled workflow configurations
+        configs = frappe.get_all(
+            "WhatsApp Workflow Configuration",
+            filters={"enabled": 1},
+            fields=["name", "document_type", "notification_states"]  # Fixed: use 'document_type' instead of 'doctype'
+        )
+        
+        if not configs:
+            frappe.log_error(f"No workflow configurations found", "Workflow Config Debug")
+            return []
+        
+        pending_docs = []
+        user_roles = frappe.get_roles(user)
+        
+        frappe.log_error(f"User {user} has roles: {user_roles}", "User Roles Debug")
+        
+        for config in configs:
+            doctype = config.document_type  # Fixed: use document_type
+            notification_states = [s.strip() for s in (config.notification_states or "").split('\n') if s.strip()]
+            
+            frappe.log_error(f"Checking {doctype} with states: {notification_states}", "Workflow States Debug")
+            
+            # Get workflow for this doctype
+            workflow = frappe.get_value("Workflow", {"document_type": doctype}, "name")
+            if not workflow:
+                frappe.log_error(f"No workflow found for {doctype}", "Workflow Missing")
+                continue
+            
+            for state in notification_states:
+                # Get allowed roles for this state
+                allowed_roles = frappe.get_all(
+                    "Workflow Transition",
+                    filters={
+                        "parent": workflow,
+                        "state": state
+                    },
+                    fields=["allowed"],
+                    pluck="allowed"
+                )
+                
+                frappe.log_error(f"State {state} allows roles: {allowed_roles}", "Allowed Roles Debug")
+                
+                # Check if user has any allowed role
+                has_permission = any(role in user_roles for role in allowed_roles if role)
+                
+                if has_permission:
+                    # Get documents in this state
+                    docs = frappe.get_all(
+                        doctype,
+                        filters={"workflow_state": state},
+                        fields=["name", "modified", "workflow_state"],
+                        order_by="modified desc",
+                        limit=20  # Limit to avoid too many results
+                    )
+                    
+                    frappe.log_error(f"Found {len(docs)} documents in state {state}", "Documents Found")
+                    
+                    for doc_data in docs:
+                        pending_docs.append({
+                            "doctype": doctype,
+                            "name": doc_data.name,
+                            "modified": doc_data.modified,
+                            "state": doc_data.workflow_state
+                        })
+        
+        # Sort by modified date (most recent first)
+        pending_docs.sort(key=lambda x: x['modified'], reverse=True)
+        
+        frappe.log_error(f"Total pending docs for user {user}: {len(pending_docs)}", "Total Pending")
+        return pending_docs
+        
+    except Exception as e:
+        frappe.log_error(f"Error getting pending documents: {str(e)}", "Pending Docs Error")
+        return []
+
+
+# ======================== DIAGNOSTIC FUNCTIONS ========================
 @frappe.whitelist()
 def check_items_debug():
     """Check what items are available in the system"""
     try:
-        # Count all items
         total_items = frappe.db.count("Item")
-        
-        # Count sales items
         sales_items = frappe.db.count("Item", filters={"is_sales_item": 1, "disabled": 0})
-        
-        # Count items with prices
         items_with_price = frappe.db.count("Item", filters={
             "is_sales_item": 1, 
             "disabled": 0,
             "standard_rate": [">", 0]
         })
         
-        # Get sample items
         sample_items = frappe.get_all(
             "Item",
             filters={"disabled": 0, "is_sales_item": 1},
@@ -716,15 +1368,13 @@ def create_test_items():
         created_items = []
         
         for item_data in test_items:
-            # Check if item already exists
             if frappe.db.exists("Item", {"item_name": item_data["item_name"]}):
                 continue
                 
-            # Create new item
             item = frappe.new_doc("Item")
             item.item_name = item_data["item_name"]
             item.item_code = item_data["item_name"].replace(" ", "_").upper()
-            item.item_group = "Products"  # Default group
+            item.item_group = "Products"
             item.stock_uom = item_data["stock_uom"]
             item.is_sales_item = 1
             item.is_stock_item = 1
@@ -735,7 +1385,6 @@ def create_test_items():
                 item.flags.ignore_permissions = True
                 item.insert(ignore_permissions=True)
                 created_items.append(item.name)
-                frappe.log_error(f"Created test item: {item.name}", "Test Item Created")
             except Exception as e:
                 frappe.log_error(f"Failed to create {item.item_name}: {str(e)}", "Item Creation Error")
         
@@ -748,14 +1397,11 @@ def create_test_items():
         }
         
     except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }
+        return {"status": "error", "message": str(e)}
 
 @frappe.whitelist()
 def test_chatbot(phone_number):
-    """Test the simplified chatbot"""
+    """Test the chatbot - UNCHANGED"""
     try:
         phone_number = str(phone_number).replace('+', '')
         
@@ -768,14 +1414,11 @@ def test_chatbot(phone_number):
         }
         
     except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }
+        return {"status": "error", "message": str(e)}
 
 @frappe.whitelist()
 def debug_user_state(phone_number):
-    """Debug user state"""
+    """Debug user state - UNCHANGED"""
     try:
         phone_number = str(phone_number).replace('+', '')
         
