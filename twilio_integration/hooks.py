@@ -17,7 +17,8 @@ fixtures = [{"dt": "Custom Field", "filters": [
 			]
 		]
 	]}
-, "Property Setter"]
+, "Property Setter",
+"Client Script"]
 
 # Includes in <head>
 # ------------------
@@ -120,11 +121,17 @@ website_route_rules = [
 
 doc_events = {
     "*": {
-        "on_update": "twilio_integration.twilio_integration.api.whatsapp_documents.add_whatsapp_button_to_form"
+        "on_update": [
+            "twilio_integration.twilio_integration.api.whatsapp_documents.add_whatsapp_button_to_form",
+            "twilio_integration.services.whatsapp_order_chatbot.send_whatsapp_workflow_notifications"
+        ],
+        "on_submit": "twilio_integration.services.whatsapp_order_chatbot.send_workflow_confirmation"
     },
     "Sales Order": {
         "before_save": "twilio_integration.services.simple_whatsapp_approval.send_approval_message",
-        "on_submit": "twilio_integration.services.whatsapp_order_chatbot.on_sales_order_submit"
+        "on_submit": "twilio_integration.services.whatsapp_order_chatbot.on_sales_order_submit",
+	"on_update": "twilio_integration.services.whatsapp_workflow.send_whatsapp_workflow_notifications",
+	"before_submit": "twilio_integration.services.whatsapp_workflow.send_approval_confirmation"
 
     },
     "WhatsApp Order Session": {
